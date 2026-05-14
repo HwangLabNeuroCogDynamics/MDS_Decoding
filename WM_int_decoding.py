@@ -50,17 +50,20 @@ def compute_patterns_multiclass(X, y):
     #   Train multiclass LDA decoders and convert decoder
     #   weights into activation patterns.
     #
-    # Why do this?
     #   Raw LDA weights are not directly interpretable because
     #   discriminative decoders absorb covariance structure and
     #   noise suppression.
     #
-    # Haufe transform:
     #   pattern = covariance @ decoder_weights
     #
     # This approximately maps decoder weights back into
     # sensor space and gives a more interpretable estimate of
     # the underlying neural activity pattern for each class.
+    #
+    # Eventually, it is possible to project single trial data on these these
+    # patterns to get single trial pattern estiamte.
+    #
+    #
     # --------------------------------------------------------
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
