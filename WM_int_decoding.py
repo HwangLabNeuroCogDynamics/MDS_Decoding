@@ -1,8 +1,8 @@
 # LDA on anaimal raising, but not looking at accuracy but underlying encoding structure
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
 import numpy as np
 import mne
 import json
@@ -13,10 +13,14 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.manifold import MDS
+from sklearn.metrics import pairwise_distances
+from scipy.linalg import subspace_angles
 from joblib import Parallel, delayed
-from scipy.stats import ttest_1samp, t
+from scipy.stats import ttest_1samp
 
-
+N_REPEATS = 10 #how many random runs of CV
+N_SPLITS = 5 #of folds
 subject_ids = ['10811','10748','10770','10808','10763','10787','10769','10764',
 '10840','10824','10736','10797','10758','10784','10844','10849','10834','10843',
 '10767','10792','10825','10836','10841','10809','10831','10762','10771','10851',
@@ -25,16 +29,14 @@ subject_ids = ['10811','10748','10770','10808','10763','10787','10769','10764',
 
 ROOT = '/mnt/nfs/lss/lss_kahwang_hpc'
 EVENT_CONFIG_FILE = os.path.join(ROOT, 'scripts/mind_mosaic/eeg/preprocessing/event_config.json')
-
 session = 'testing'
 EPOCH_FOLDER = 'epochs'
 PREPROCESS_DATA = 'preprocessed_cue_decoding'
 DESIGNS = ['Int', 'NoInt']
 
-# LDA 
 
 # ============================================================
-# use LDA to extract neural patterns that discrimate color or ori
+# use LDA to extract neural patterns that discriminate color or ori
 # ============================================================
 def compute_patterns_multiclass(X, y):
     # --------------------------------------------------------
@@ -46,217 +48,277 @@ def compute_patterns_multiclass(X, y):
     #
     # Goal:
     #   Train multiclass LDA decoders and convert decoder
-    #   weights into activation patterns 
-    #   Raw decoder weights are difficult to interpret because
-    #   discriminative models are influenced by covariance
-    #   structure and noise suppression.
+    #   weights into activation patterns.
     #
-    #   therefore we get pattern = covariance @ decoder_weights
+    # Why do this?
+    #   Raw LDA weights are not directly interpretable because
+    #   discriminative decoders absorb covariance structure and
+    #   noise suppression.
     #
-    #   approximately maps decoder weights back into signal /
-    #   sensor space, then compute similarity later
-    # --------------------------------------------------------
-
-
-    # --------------------------------------------------------
-    # First convert labels into integer values
+    # Haufe transform:
+    #   pattern = covariance @ decoder_weights
+    #
+    # This approximately maps decoder weights back into
+    # sensor space and gives a more interpretable estimate of
+    # the underlying neural activity pattern for each class.
     # --------------------------------------------------------
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
+    class_patterns = {c: [] for c in np.unique(y_enc)}
 
+    for rep in range(N_REPEATS):
+        skf = StratifiedKFold(N_SPLITS, shuffle=True, random_state=rep)
 
-    
-    # 5 fold CV
-    skf = StratifiedKFold( 5, shuffle=True, random_state=0 )
+        for train_idx, _ in skf.split(X, y_enc):
 
-    class_patterns = {
-        c: [] for c in np.unique(y_enc)
-    }
+            X_train = X[train_idx]
+            y_train = y_enc[train_idx]
 
-    # cross-validation loop
-    for train_idx, test_idx in skf.split(X, y_enc):
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
 
-        # ----------------------------------------------------
-        # extract training data for this fold
-        #
-        # X_train shape:
-        #   (n_train_trials, n_channels)
-        # ----------------------------------------------------
-        X_train = X[train_idx]
-        y_train = y_enc[train_idx]
-        
-        # z-score each channel
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
+            lda = LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')
+            lda.fit(X_train_scaled, y_train)
 
+            Ws = lda.coef_
+            cov = np.cov(X_train_scaled, rowvar=False)
 
-        # ----------------------------------------------------
-        # train multiclass LDA
-        lda = LinearDiscriminantAnalysis( solver='lsqr', shrinkage='auto')
-        lda.fit(X_train_scaled, y_train)
+            for c_idx, w in enumerate(Ws):
 
-        # ----------------------------------------------------
-        # decoder weights
-        #
-        # shape:
-        #   (n_classes, n_channels)
-        #
-        # each row is one discriminant vector
-        # ----------------------------------------------------
-        Ws = lda.coef_
+                pattern = cov @ w
+                norm = np.linalg.norm(pattern)
 
-        # ----------------------------------------------------
-        # compute feature covariance matrix
-        #
-        # shape:
-        #   (n_channels, n_channels)
-        #
-        # rowvar=False:
-        #   columns = variables/channels
-        # ----------------------------------------------------
-        cov = np.cov( X_train_scaled, rowvar=False )
+                if norm > 0:
+                    pattern = pattern / norm
 
-
-        # ====================================================
-        # compute patterns for each class or trial type
-        # ====================================================
-        for c_idx, w in enumerate(Ws):
-
-
-            # ------------------------------------------------
-            # transform decoding coeficients into comaprable scale 
-            # pattern = covariance @ weights
-            # converts discriminative weights into activation
-            # patterns that better reflect underlying neural topographies
-            # ------------------------------------------------
-            pattern = cov @ w
-
-
-            # ------------------------------------------------
-            # normalize vector length to unit norm
-            # this removes arbitrary magnitude scaling and
-            # allows comparisons across folds/classes
-            # ------------------------------------------------
-            norm = np.linalg.norm(pattern)
-
-            if norm > 0:
-                pattern = pattern / norm
-            class_patterns[c_idx].append(pattern)
+                class_patterns[c_idx].append(pattern)
 
     patterns_avg = []
     for c_idx in sorted(class_patterns.keys()):
-        # average across folds 
-        p = np.mean( class_patterns[c_idx], axis=0 )
-
-        # renormalize after averaging
+        p = np.mean(class_patterns[c_idx], axis=0)
         norm = np.linalg.norm(p)
-
         if norm > 0:
             p = p / norm
-
         patterns_avg.append(p)
 
     return np.array(patterns_avg)
 
-#################################
-### below is the similarity matrices for comparing whether the pattern encoding color are similar to those for orientation
-# it is possible that joint v selective will have different encoding geometry?
-##########################################
+    # output:
+    # shape: (n_classes, n_channels)
+    # each row = neural representation pattern of a class
+
+
+# ============================================================
+# COSINE SIMILARITY
+# ============================================================
 def cosine_metric(A, B):
+
+    # Compare alignment of individual representation vectors
+    # high cosine:   patterns point in similar directions
+    # low cosine:   patterns use different channel configurations
+    #
+
+
     A = A - A.mean(axis=0)
     B = B - B.mean(axis=0)
-    return np.mean(cosine_similarity(A, B)) #cosine similarity of the pattern
 
-# from XT
-def get_feature_maps(design):
-    if design == 'Int':
-        color_map = {'Af1':360,'Am1':300,'Am2':360,'Af2':300,'Bf2':120,'Bm1':60,'Bm2':120,'Bf1':60}
-        ori_map   = {'Af1':195,'Am1':195,'Am2':225,'Af2':225,'Bf2':15,'Bm1':15,'Bm2':45,'Bf1':45}
-    else:
-        color_map = {"Caf1":360,"Caf2":300,"Cam1":360,"Cam2":300,"Cbf1":120,"Cbf2":60,"Cbm1":120,"Cbm2":60,
-                     "Daf1":360,"Daf2":360,"Dam1":300,"Dam2":300,"Dbf1":120,"Dbf2":120,"Dbm1":60,"Dbm2":60}
-        ori_map   = {"Caf1":225,"Caf2":225,"Cam1":195,"Cam2":195,"Cbf1":15,"Cbf2":15,"Cbm1":45,"Cbm2":45,
-                     "Daf1":225,"Daf2":195,"Dam1":225,"Dam2":195,"Dbf1":15,"Dbf2":45,"Dbm1":15,"Dbm2":45}
+    return np.mean(cosine_similarity(A, B))
 
-    return color_map, ori_map
 
-####################################################
-# below is cross validated distance
-##########################################
+# ============================================================
+# SUBSPACE ANGLE
+# ============================================================
+def subspace_angle_metric(A, B):
+
+    # Compare representational spaces
+    #
+    # A and B spaces are(n_classes, n_channels)
+    #
+    # treat rows as spanning a subspace in channel space.
+    # So 0 degree will mean overlap, 90 degree would be orthogonal
+    # small angle:   shared / overlapping representational geometry
+    #
+    # large angle:   orthogonal / factorized geometry
+
+    angles = subspace_angles(A.T, B.T)
+
+    # mean principal angle
+    return np.mean(angles)
+
 
 def compute_means(X, y):
+
     classes = np.unique(y)
-    means = {c: X[y == c].mean(axis=0) for c in classes}
+
+    means = {
+        c: X[y == c].mean(axis=0)
+        for c in classes
+    }
+
     return means
 
+
 def compute_noise_cov(X, y):
+
     resid = []
     for c in np.unique(y):
         Xc = X[y == c]
         mean = Xc.mean(axis=0)
         resid.append(Xc - mean)
+
     resid = np.vstack(resid)
     cov = np.cov(resid, rowvar=False)
+
     return cov
 
-def crossnobis_metric(X, y):
 
+# ============================================================
+# SUBSPACE CROSSNOBIS
+# ============================================================
+
+def subspace_crossnobis_metric(X, y, patterns):
+    # This is the distance-based analogue of subspace decoding
+    #
+    # Step 1:
+    #   project EEG data into another representational space for example
+    #   project ORI into color subspace
+    #
+    # Step 2:
+    #   ask whether ori information is still separable
+    #   inside that projected space
+    # high value: ori survives projection into color space shared / integrated representation
+    # low value:ori disappears after projection factorized representation
+   
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
 
-    skf = StratifiedKFold(5, shuffle=True, random_state=0)
+    all_distances = []
 
-    distances = []
+    for rep in range(N_REPEATS):
 
-    for train_idx, test_idx in skf.split(X, y_enc):
+        skf = StratifiedKFold(N_SPLITS, shuffle=True, random_state=rep)
+        distances = []
 
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y_enc[train_idx], y_enc[test_idx]
+        for train_idx, test_idx in skf.split(X, y_enc):
 
-        # standardize (important!)
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test  = scaler.transform(X_test)
+            X_train = X[train_idx]
+            X_test  = X[test_idx]
 
-        means_train = compute_means(X_train, y_train)
-        means_test  = compute_means(X_test, y_test)
+            y_train = y_enc[train_idx]
+            y_test  = y_enc[test_idx]
 
-        cov = compute_noise_cov(X_train, y_train)
-        inv_cov = np.linalg.pinv(cov)
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test  = scaler.transform(X_test)
 
-        classes = np.unique(y_train)
+            X_train_proj = X_train @ patterns.T
+            X_test_proj  = X_test @ patterns.T
 
-        # compute all pairwise distances
-        fold_dists = []
+            means_train = compute_means(X_train_proj, y_train)
+            means_test  = compute_means(X_test_proj, y_test)
 
-        for i in range(len(classes)):
-            for j in range(i+1, len(classes)):
+            cov = compute_noise_cov(X_train_proj, y_train)
+            cov += np.eye(cov.shape[0]) * 1e-6
 
-                c1, c2 = classes[i], classes[j]
+            inv_cov = np.linalg.pinv(cov)
 
-                d1 = means_train[c1] - means_train[c2]
-                d2 = means_test[c1]  - means_test[c2]
+            classes = np.unique(y_train)
+            fold_dists = []
 
-                d = d1 @ inv_cov @ d2
-                fold_dists.append(d)
+            for i in range(len(classes)):
+                for j in range(i + 1, len(classes)):
+                    c1, c2 = classes[i], classes[j]
 
-        distances.append(np.mean(fold_dists))
+                    d1 = means_train[c1] - means_train[c2]
+                    d2 = means_test[c1]  - means_test[c2]
 
-    return np.mean(distances)
+                    d = d1 @ inv_cov @ d2
+                    fold_dists.append(d)
+
+            distances.append(np.mean(fold_dists))
+
+        all_distances.append(np.mean(distances))
+
+    return np.mean(all_distances)
+
+
+def get_feature_maps(design):
+
+    if design == 'Int':
+
+        color_map = {
+            'Af1':360,'Am1':300,'Am2':360,'Af2':300,
+            'Bf2':120,'Bm1':60,'Bm2':120,'Bf1':60
+        }
+
+        ori_map = {
+            'Af1':195,'Am1':195,'Am2':225,'Af2':225,
+            'Bf2':15,'Bm1':15,'Bm2':45,'Bf1':45
+        }
+
+    else:
+
+        color_map = {
+            "Caf1":360,"Caf2":300,"Cam1":360,"Cam2":300,
+            "Cbf1":120,"Cbf2":60,"Cbm1":120,"Cbm2":60,
+            "Daf1":360,"Daf2":360,"Dam1":300,"Dam2":300,
+            "Dbf1":120,"Dbf2":120,"Dbm1":60,"Dbm2":60
+        }
+
+        ori_map = {
+            "Caf1":225,"Caf2":225,"Cam1":195,"Cam2":195,
+            "Cbf1":15,"Cbf2":15,"Cbm1":45,"Cbm2":45,
+            "Daf1":225,"Daf2":195,"Dam1":225,"Dam2":195,
+            "Dbf1":15,"Dbf2":45,"Dbm1":15,"Dbm2":45
+        }
+
+    return color_map, ori_map
+
+
+###### distance metrics:
+
+def euclidean_pattern_metric(A, B):
+    A = A - A.mean(axis=0)
+    B = B - B.mean(axis=0)
+    D = pairwise_distances(A, B, metric='euclidean')
+    return np.mean(D)
+
+
+
+def correlation_similarity_metric(A, B):
+    A = A - A.mean(axis=0)
+    B = B - B.mean(axis=0)
+    D = 1 - pairwise_distances(A, B, metric='correlation')
+    return np.mean(D)
+
+
+
+def correlation_distance_metric(A, B):
+    A = A - A.mean(axis=0)
+    B = B - B.mean(axis=0)
+    D = pairwise_distances(A, B, metric='correlation')
+    return np.mean(D)
 
 
 def process_subject(subject_id):
 
     results = {}
     for design in DESIGNS:
-        files = glob(os.path.join( ROOT, f"data/MindMosaic_EEG/sub-{subject_id}", PREPROCESS_DATA, EPOCH_FOLDER, f"sub-{subject_id}_design-{design}_session-{session}_cue*epo*.fif.gz" ))
+
+        files = glob(os.path.join(
+            ROOT,
+            f"data/MindMosaic_EEG/sub-{subject_id}",
+            PREPROCESS_DATA,
+            EPOCH_FOLDER,
+            f"sub-{subject_id}_design-{design}_session-{session}_cue*epo*.fif.gz"
+        ))
 
         if not files:
             continue
 
-        epochs = mne.read_epochs(files[0], preload=True, verbose=False)
-        epochs.apply_baseline((-0.5, 0)) # is this necessary?
+        epochs = mne.read_epochs( files[0], preload=True, verbose=False )
 
+        epochs.apply_baseline((-0.5, 0))
         X = epochs.copy().pick('eeg').get_data()
         metadata = epochs.metadata.copy()
         times = epochs.times
@@ -264,30 +326,46 @@ def process_subject(subject_id):
         with open(EVENT_CONFIG_FILE) as f:
             event_config = json.load(f)[design][session]
 
-        rev = {v:k[5:] for k,v in event_config['probe_event_id'].items()}
+        rev = {
+            v:k[5:]
+            for k,v in event_config['probe_event_id'].items()
+        }
+
         metadata['combos'] = metadata['probe_trigger'].map(rev)
         color_map, ori_map = get_feature_maps(design)
         metadata['color'] = metadata['combos'].map(color_map)
-        metadata['ori'] = metadata['combos'].map(ori_map)
-
+        metadata['ori']   = metadata['combos'].map(ori_map)
         valid = ~metadata['response_trigger'].isna()
+
         X = X[valid]
         metadata = metadata[valid]
 
-        # time course of subspace similarity
-        tc = {m:[] for m in ['cosine', 'crossnobis']}
+        tc = {
+            m:[] for m in [
+                'cosine',
+                'subspace_angle',
+                'subspace_crossnobis',
+                'euclidean',
+                'corr_sim',
+                'corr_dist'
+            ]
+        }
 
         for t in range(len(times)):
+
             try:
-                p_color = compute_patterns_multiclass(X[:,:,t], metadata['color'])
-                p_ori   = compute_patterns_multiclass(X[:,:,t], metadata['ori'])
-                tc['cosine'].append(cosine_metric(p_color, p_ori))
 
-                cn_color = crossnobis_metric(X[:,:,t], metadata['color'])
-                cn_ori   = crossnobis_metric(X[:,:,t], metadata['ori'])
+                Xt = X[:,:,t]
+                p_color = compute_patterns_multiclass( Xt, metadata['color'] )
 
-                # store average (you could also store separately if you want)
-                tc['crossnobis'].append((cn_color + cn_ori) / 2)
+                p_ori = compute_patterns_multiclass( Xt, metadata['ori'] )
+
+                tc['cosine'].append( cosine_metric(p_color, p_ori) )
+                tc['subspace_angle'].append( subspace_angle_metric(p_color, p_ori) )
+                tc['subspace_crossnobis'].append( subspace_crossnobis_metric( Xt, metadata['ori'], p_color ) )
+                tc['euclidean'].append( euclidean_pattern_metric(p_color, p_ori) )
+                tc['corr_sim'].append( correlation_similarity_metric(p_color, p_ori) )
+                tc['corr_dist'].append( correlation_distance_metric(p_color, p_ori) )
 
             except:
                 for k in tc:
@@ -295,17 +373,27 @@ def process_subject(subject_id):
 
         results[design] = {
             'times': times,
-            'metrics': {k: np.array(v) for k,v in tc.items()}
+            'metrics': {
+                k: np.array(v)
+                for k,v in tc.items()
+            }
         }
 
     return results
 
 
-# RUN 
 all_results = Parallel(n_jobs=40)( delayed(process_subject)(sid) for sid in subject_ids )
 
-metrics = ['cosine', 'crossnobis']
-group_data = {m: {'Int':[], 'NoInt':[]} for m in metrics}
+metrics = [
+    'cosine',
+    'subspace_angle',
+    'subspace_crossnobis',
+    'euclidean',
+    'corr_sim',
+    'corr_dist'
+]
+
+group_data = { m: {'Int':[], 'NoInt':[]} for m in metrics }
 
 for r in all_results:
     if isinstance(r,dict) and 'Int' in r and 'NoInt' in r:
@@ -316,23 +404,138 @@ for r in all_results:
                 group_data[m]['Int'].append(a)
                 group_data[m]['NoInt'].append(b)
 
-for m in metrics:
 
+
+################################
+#### t stats
+############################
+from statsmodels.stats.multitest import fdrcorrection
+
+for m in metrics:
     tc_a = np.stack(group_data[m]['Int'])
     tc_b = np.stack(group_data[m]['NoInt'])
-
-    diff = tc_a - tc_b
-    mean_diff = diff.mean(0)
-
-    times = r['Int']['times']
-
-    # compute t-values then plot
-    t_obs, _ = ttest_1samp(diff, 0, axis=0)
+    diff = tc_a - tc_b 
+    times = all_results[0]['Int']['times']
+    t_obs, p_vals = ttest_1samp(diff, 0, axis=0)
+    # fdr
+    reject, p_fdr = fdrcorrection(p_vals, alpha=0.05)
 
     plt.figure()
     plt.plot(times, t_obs, label='t-value')
     plt.axhline(0)
+    plt.scatter(
+        times[reject],
+        t_obs[reject],
+        color='red',
+        s=15,
+        label='FDR q < 0.05'
+    )
 
-    plt.title(f"{m} (t-values)")
+    plt.title(f"{m} (Int - NoInt t-values, FDR corrected)")
     plt.legend()
+    plt.show()
+
+
+############################
+#### here is cluster statistics
+############################
+# find clusters (contiguous supra-threshold points)
+def find_clusters(t_vals, threshold):
+
+    clusters = []
+    current = []
+
+    for i, t in enumerate(t_vals):
+        if np.abs(t) > threshold:
+            current.append(i)
+        else:
+            if current:
+                clusters.append(current)
+                current = []
+
+    if current:
+        clusters.append(current)
+
+    return clusters
+
+# cluster statistic = sum of t-values
+def cluster_stat(t_vals, clusters):
+    return [np.sum(t_vals[c]) for c in clusters]
+
+# one permutation (sign flip)
+def permute_once(diff):
+    n_subj = diff.shape[0]
+    signs = np.random.choice([1, -1], size=(n_subj, 1))
+    permuted = diff * signs
+    t_perm, _ = ttest_1samp(permuted, 0, axis=0)
+    return t_perm
+
+
+n_perm = 1000
+threshold = 2.0   # ~p < .05 for ~40 subjects
+for m in metrics:
+
+    print(f"\nRunning cluster test for: {m}")
+    tc_a = np.stack(group_data[m]['Int'])
+    tc_b = np.stack(group_data[m]['NoInt'])
+    diff = tc_a - tc_b
+    times = all_results[0]['Int']['times']
+    t_obs, _ = ttest_1samp(diff, 0, axis=0)
+    clusters = find_clusters(t_obs, threshold)
+    cluster_stats_obs = cluster_stat(t_obs, clusters)
+
+    perm_t = Parallel(n_jobs=40)( delayed(permute_once)(diff) for _ in range(n_perm) )
+    max_cluster_dist = []
+
+    for t_perm in perm_t:
+
+        clust = find_clusters(t_perm, threshold)
+        if len(clust) == 0:
+            max_cluster_dist.append(0)
+        else:
+            stats = cluster_stat(t_perm, clust)
+            max_cluster_dist.append(np.max(stats))
+
+    max_cluster_dist = np.array(max_cluster_dist)
+    cluster_pvals = []
+
+    for stat in cluster_stats_obs:
+        p = np.mean(max_cluster_dist >= stat)
+        cluster_pvals.append(p)
+
+    plt.figure()
+    plt.plot(times, t_obs, label='t-values')
+    plt.axhline(0)
+
+    # highlight significant clusters
+    for c, p in zip(clusters, cluster_pvals):
+        if p < 0.05:
+            plt.plot(times[c], t_obs[c], linewidth=4)
+
+    plt.title(f"{m} cluster-corrected (p<.05)")
+    plt.legend()
+    plt.show()
+
+    print("Clusters:")
+    for c, p in zip(clusters, cluster_pvals):
+        print(f"  time {times[c[0]]:.3f}–{times[c[-1]]:.3f} | p={p:.4f}")
+
+# MDS
+def run_mds_visualization(X, labels, title='MDS'):
+
+    classes = np.unique(labels)
+    means = [ X[labels == c].mean(axis=0) for c in classes ]
+    means = np.array(means)
+    # pairwise condition distances
+    D = pairwise_distances( means, metric='euclidean' )
+
+    mds = MDS( n_components=2, dissimilarity='precomputed', random_state=0 )
+
+    coords = mds.fit_transform(D)
+    plt.figure()
+
+    for i, c in enumerate(classes):
+        plt.scatter(coords[i,0], coords[i,1])
+        plt.text(coords[i,0], coords[i,1], str(c))
+    plt.title(title)
     plt.show()
