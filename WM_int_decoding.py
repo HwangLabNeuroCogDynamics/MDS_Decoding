@@ -1,8 +1,8 @@
 # LDA on anaimal raising, but not looking at accuracy but underlying encoding structure
 import os
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = ""
+os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 import mne
 import json
@@ -21,17 +21,21 @@ from scipy.stats import ttest_1samp
 
 N_REPEATS = 10 #how many random runs of CV
 N_SPLITS = 5 #of folds
-subject_ids = ['10811','10748','10770','10808','10763','10787','10769','10764',
-'10840','10824','10736','10797','10758','10784','10844','10849','10834','10843',
-'10767','10792','10825','10836','10841','10809','10831','10762','10771','10851',
-'10814','10747','10730','10842','10835','10083','10263','10761','10785','10845',
-'10819','10813']
+# subject_ids = ['10811','10748','10770','10808','10763','10787','10769','10764',
+# '10840','10824','10736','10797','10758','10784','10844','10849','10834','10843',
+# '10767','10792','10825','10836','10841','10809','10831','10762','10771','10851',
+# '10814','10747','10730','10842','10835','10083','10263','10761','10785','10845',
+# '10819','10813']
+
+with open("/mnt/nfs/lss/lss_kahwang_hpc/scripts/mind_mosaic/eeg/qc_check/EEG_clean_subject_ids.txt") as f:
+    txt = f.read()
+subject_ids = np.array( [x.strip() for x in txt.split(",") if x.strip()], dtype=str )
 
 ROOT = '/mnt/nfs/lss/lss_kahwang_hpc'
 EVENT_CONFIG_FILE = os.path.join(ROOT, 'scripts/mind_mosaic/eeg/preprocessing/event_config.json')
 session = 'testing'
 EPOCH_FOLDER = 'epochs'
-PREPROCESS_DATA = 'preprocessed_cue_decoding'
+PREPROCESS_DATA = 'preprocessed_decoding_hp01_lp50_interp8'
 DESIGNS = ['Int', 'NoInt']
 
 
